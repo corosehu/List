@@ -28,6 +28,7 @@ import re
 import sqlite3
 import json
 import traceback
+import logging
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Any
 from enum import Enum
@@ -69,6 +70,17 @@ except ImportError:
 # =========================
 # === CONFIGURATION =======
 # =========================
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot_activity.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8118285986:AAGFGuH_-i3y24Ig5j84eloIIpqFyBCXz9Y")
 ADMIN_IDS = {6827291977}  # Your Telegram user IDs
@@ -936,9 +948,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "upload_file":
             await q.edit_message_text(
-                "📤 **Upload Current File**\n"
-                "Please send a `.txt` or `.csv` file that was previously exported by this bot.\n"
-                "The bot will restore all links/usernames into the current database and file.",
+                "📤 **Upload & Restore**\n\n"
+                "This feature allows you to restore links and usernames from a previously exported `.txt` or `.csv` file.\n\n"
+                "**How it works:**\n"
+                "1. Send a file containing links or @usernames.\n"
+                "2. The bot will read the file and add all unique entries to the main database.\n"
+                "3. Duplicates will be automatically skipped.\n\n"
+                "⚠️ **Important:** This does not import or join groups. It only restores individual links and usernames to the bot's saved collection.\n\n"
+                "Please send your file now.",
                 parse_mode=ParseMode.MARKDOWN
             )
             # Set a state to expect file
@@ -1307,28 +1324,36 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         return  # Ignore random docs
 
     document = update.effective_message.document
+    chat_id = update.effective_chat.id
+
     if not document:
+        logger.warning(f"User {chat_id} sent an invalid document.")
         await update.message.reply_text("❌ Please send a valid file.")
         return
 
-    file_ext = Path(document.file_name).suffix.lower()
+    file_name = document.file_name
+    file_ext = Path(file_name).suffix.lower()
+    logger.info(f"Received file upload '{file_name}' from user {chat_id}.")
+
     if file_ext not in (".txt", ".csv"):
+        logger.warning(f"Unsupported file type '{file_ext}' from user {chat_id}.")
         await update.message.reply_text("❌ Only `.txt` or `.csv` files are supported.")
         return
 
-    chat_id = update.effective_chat.id
     conn = connect_db(chat_id)
     try:
         # Get file
         file = await document.get_file()
         temp_path = DATA_DIR / f"temp_upload_{chat_id}_{document.file_unique_id}{file_ext}"
         await file.download_to_drive(temp_path)
+        logger.info(f"File downloaded to temporary path: {temp_path}")
 
         current_file, current_fmt = read_current_file(chat_id)
         current_fmt = current_fmt if current_fmt in ("txt", "csv") else "txt"
         if not current_file:
             current_file = next_file_name(chat_id, current_fmt)
             set_current_file(chat_id, current_file, current_fmt)
+            logger.info(f"No current file found. Created new file: {current_file.name}")
 
         current_file.touch(exist_ok=True)
         ensure_file_not_empty(current_file, current_fmt)
@@ -1336,27 +1361,29 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         added = 0
         skipped = 0
 
+        logger.info(f"Starting to process file '{file_name}' with format '{file_ext}'")
         if file_ext == ".csv":
             with temp_path.open("r", encoding="utf-8", newline="") as f:
-                # Peek at the header to determine file type
                 try:
                     header = next(csv.reader(f))
-                    f.seek(0)  # Reset file pointer
+                    f.seek(0)
                     reader = csv.DictReader(f)
-                except StopIteration:  # Handle empty file
+                    logger.info(f"CSV header detected: {header}")
+                except StopIteration:
+                    logger.warning("Uploaded CSV file is empty.")
                     header = []
                     reader = []
 
-                # Check if it's a group export file (has 'username' and 'name')
-                # or a standard links file (has 'content' and 'type')
                 is_group_export = "username" in header and "name" in header
                 is_links_file = "content" in header and "type" in header
+                logger.info(f"CSV type detection: is_group_export={is_group_export}, is_links_file={is_links_file}")
 
                 if is_links_file:
-                    for row in reader:
+                    for i, row in enumerate(reader):
                         content = row.get("content", "").strip()
                         ctype = row.get("type", "").strip()
                         if not content or ctype not in ("link", "username"):
+                            logger.debug(f"Row {i+1}: Skipping invalid row: {row}")
                             continue
                         if ctype == "username":
                             content = content.lower()
@@ -1376,15 +1403,13 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                             save_duplicate(chat_id, content, ctype, conn)
                             incr_stat(conn, "dups_total", 1)
                             skipped += 1
-
                 elif is_group_export:
-                    for row in reader:
+                    for i, row in enumerate(reader):
                         username = row.get("username", "").strip()
                         if not username:
+                            logger.debug(f"Row {i+1}: Skipping group with no username: {row}")
                             continue
 
-                        # From one group username, we can generate a link and a @username
-                        # This list will hold tuples of (content, type)
                         contents_to_add = [
                             (f"https://t.me/{username}", "link"),
                             (f"@{username}", "username")
@@ -1409,26 +1434,31 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                                 save_duplicate(chat_id, content, ctype, conn)
                                 incr_stat(conn, "dups_total", 1)
                                 skipped += 1
+                else:
+                    logger.warning(f"CSV file '{file_name}' has an unknown format. Header: {header}")
+
         else:  # .txt
             with temp_path.open("r", encoding="utf-8") as f:
-                for line in f:
+                for i, line in enumerate(f):
                     line = line.strip()
                     if not line or line.startswith("#"):
+                        logger.debug(f"Line {i+1}: Skipping comment or empty line.")
                         continue
 
-                    contents_to_add = [] # List of (content, ctype) tuples
+                    logger.debug(f"Line {i+1}: Processing raw line: '{line}'")
+                    contents_to_add = []
 
-                    # First, try to parse the detailed format: "content (type) - timestamp"
                     if " (" in line and ") - " in line:
                         try:
                             content_part, rest = line.split(" (", 1)
                             ctype_part, _ = rest.split(") - ", 1)
                             if ctype_part in ("link", "username"):
                                 contents_to_add.append((content_part, ctype_part))
+                                logger.debug(f"Line {i+1}: Parsed as detailed format: content='{content_part}', type='{ctype_part}'")
                         except Exception:
-                            pass # It's not the detailed format, so we'll try the simple format next.
+                            logger.debug(f"Line {i+1}: Failed to parse as detailed format, will treat as simple content.")
+                            pass
 
-                    # If not parsed as detailed, treat as simple content from the raw line
                     if not contents_to_add:
                         links = [m.group(1) for m in URL_REGEX.finditer(line)]
                         usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
@@ -1438,21 +1468,18 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                         for username in usernames:
                             contents_to_add.append((username, "username"))
 
-                        # If no links or @usernames were found on the line,
-                        # check if the line itself could be a plain username.
                         if not links and not usernames:
                             line_content = line.strip()
-                            # Heuristic: if it's a single word without typical URL chars, treat as username.
                             if ' ' not in line_content and '.' not in line_content and '/' not in line_content and ':' not in line_content:
                                 potential_username = line_content.lstrip('@')
-                                # Check against Telegram's username rules (approx)
                                 if 5 <= len(potential_username) <= 32 and \
                                    potential_username and potential_username[0].isalpha() and \
                                    all(c.isalnum() or c == '_' for c in potential_username):
                                     contents_to_add.append((potential_username, "username"))
 
+                    if not contents_to_add:
+                        logger.debug(f"Line {i+1}: No content found to add after parsing.")
 
-                    # Process all found content from the line
                     for content, ctype in contents_to_add:
                         if ctype == "link" and content.lower().startswith("www."):
                             content = "https://" + content
@@ -1477,6 +1504,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                             skipped += 1
 
         conn.commit()
+        logger.info(f"File processing complete. Added: {added}, Skipped: {skipped}")
         conn.close()
         temp_path.unlink(missing_ok=True)
         context.user_data["expecting_upload"] = False
@@ -1494,12 +1522,12 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     except Exception as e:
-        print(f"Upload error: {traceback.format_exc()}")
+        logger.error(f"Upload failed for user {chat_id} with file '{file_name}': {traceback.format_exc()}")
         await update.message.reply_text(
-            f"❌ Upload failed: {str(e)}",
+            f"❌ Upload failed: An unexpected error occurred. Please check the logs.",
             reply_markup=main_keyboard()
         )
-        if "temp_path" in locals():
+        if "temp_path" in locals() and temp_path.exists():
             temp_path.unlink(missing_ok=True)
         context.user_data["expecting_upload"] = False
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
