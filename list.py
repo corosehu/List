@@ -349,6 +349,7 @@ async def admin_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
 
 def main_keyboard() -> InlineKeyboardMarkup:
     buttons = [
+        [InlineKeyboardButton("📤 Upload Current File", callback_data="upload_file")],
         [InlineKeyboardButton("📥 Download Current File", callback_data="dl_current")],
         [
             InlineKeyboardButton("📄 New File", callback_data="new_file"),
@@ -932,7 +933,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     try:
-        if data == "tg_login":
+        if data == "upload_file":
+            await q.edit_message_text(
+                "📤 **Upload Current File**\n"
+                "Please send a `.txt` or `.csv` file that was previously exported by this bot.\n"
+                "The bot will restore all links/usernames into the current database and file.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            # Set a state to expect file
+            context.user_data["expecting_upload"] = True
+
+        elif data == "tg_login":
             await q.edit_message_text(
                 "👤 **Telegram Account Login**\n\n"
                 "Login with your Telegram account to:\n"
@@ -1287,6 +1298,131 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === MESSAGE HANDLER =====
 # =========================
 
+async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_guard(update, context):
+        return
+
+    if not context.user_data.get("expecting_upload"):
+        return  # Ignore random docs
+
+    document = update.effective_message.document
+    if not document:
+        await update.message.reply_text("❌ Please send a valid file.")
+        return
+
+    file_ext = Path(document.file_name).suffix.lower()
+    if file_ext not in (".txt", ".csv"):
+        await update.message.reply_text("❌ Only `.txt` or `.csv` files are supported.")
+        return
+
+    chat_id = update.effective_chat.id
+    conn = connect_db(chat_id)
+    try:
+        # Get file
+        file = await document.get_file()
+        temp_path = DATA_DIR / f"temp_upload_{chat_id}_{document.file_unique_id}{file_ext}"
+        await file.download_to_drive(temp_path)
+
+        current_file, current_fmt = read_current_file(chat_id)
+        current_fmt = current_fmt if current_fmt in ("txt", "csv") else "txt"
+        if not current_file:
+            current_file = next_file_name(chat_id, current_fmt)
+            set_current_file(chat_id, current_file, current_fmt)
+
+        current_file.touch(exist_ok=True)
+        ensure_file_not_empty(current_file, current_fmt)
+
+        added = 0
+        skipped = 0
+
+        if file_ext == ".csv":
+            with temp_path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    content = row.get("content", "").strip()
+                    ctype = row.get("type", "").strip()
+                    if not content or ctype not in ("link", "username"):
+                        continue
+                    if ctype == "username":
+                        content = content.lower()
+                    try:
+                        conn.execute(
+                            "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
+                            (content, ctype, dt.datetime.utcnow().isoformat())
+                        )
+                        write_content_to_file(current_file, content, ctype, current_fmt)
+                        incr_stat(conn, "content_total", 1)
+                        if ctype == "link":
+                            incr_stat(conn, "links_saved", 1)
+                        else:
+                            incr_stat(conn, "usernames_saved", 1)
+                        added += 1
+                    except sqlite3.IntegrityError:
+                        save_duplicate(chat_id, content, ctype, conn)
+                        incr_stat(conn, "dups_total", 1)
+                        skipped += 1
+        else:  # .txt
+            with temp_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Try to parse: "content (type) - timestamp"
+                    if " (" in line and ") - " in line:
+                        try:
+                            content_part, rest = line.split(" (", 1)
+                            ctype_part, _ = rest.split(") - ", 1)
+                            content = content_part
+                            ctype = ctype_part
+                            if ctype not in ("link", "username"):
+                                continue
+                            if ctype == "username":
+                                content = content.lower()
+                            try:
+                                conn.execute(
+                                    "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
+                                    (content, ctype, dt.datetime.utcnow().isoformat())
+                                )
+                                write_content_to_file(current_file, content, ctype, current_fmt)
+                                incr_stat(conn, "content_total", 1)
+                                if ctype == "link":
+                                    incr_stat(conn, "links_saved", 1)
+                                else:
+                                    incr_stat(conn, "usernames_saved", 1)
+                                added += 1
+                            except sqlite3.IntegrityError:
+                                save_duplicate(chat_id, content, ctype, conn)
+                                incr_stat(conn, "dups_total", 1)
+                                skipped += 1
+                        except Exception:
+                            continue  # Skip malformed lines
+
+        conn.commit()
+        conn.close()
+        temp_path.unlink(missing_ok=True)
+        context.user_data["expecting_upload"] = False
+
+        total = get_stat(connect_db(chat_id), "content_total")
+
+        await update.message.reply_text(
+            f"✅ **Upload Complete**\n"
+            f"• Added: {added}\n"
+            f"• Duplicates: {skipped}\n"
+            f"• Total Saved Now: {total:,}\n"
+            f"Current file updated: `{current_file.name}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard()
+        )
+
+    except Exception as e:
+        print(f"Upload error: {traceback.format_exc()}")
+        await update.message.reply_text(
+            f"❌ Upload failed: {str(e)}",
+            reply_markup=main_keyboard()
+        )
+        if "temp_path" in locals():
+            temp_path.unlink(missing_ok=True)
+        context.user_data["expecting_upload"] = False
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_guard(update, context):
         return
@@ -1428,6 +1564,7 @@ def main():
     
     # Message handler
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     
     print("✅ Professional Link & Group Saver Bot is running...")
     print("📞 Support: @Corose | @fxeeo")
