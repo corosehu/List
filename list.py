@@ -110,6 +110,7 @@ URL_REGEX = re.compile(
     r'(?i)\b((?:https?://|www\d{0,3}[.]|t\.me/|telegram\.me/|[a-z0-9.\-]+\.[a-z]{2,})(?:[^\s<>"]+))'
 )
 USERNAME_REGEX = re.compile(r'@([a-zA-Z0-9_]{5,32})')
+TELEGRAM_LINK_REGEX = re.compile(r'(https?://)?(www\.)?(t\.me|telegram\.me)/([a-zA-Z0-9_]{5,32})/?')
 
 # =========================
 # === DATABASE SETUP ======
@@ -1509,12 +1510,24 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["expecting_upload"] = False
 
 def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype):
-    """Helper to add a single piece of content to the DB and file, returns (added, skipped)."""
+    """Normalizes content and adds it to the DB, returning (added, skipped)."""
     if not content:
         return 0, 0
 
-    if ctype == "link" and content.lower().startswith("www."):
-        content = "https://" + content
+    # --- Normalization Logic ---
+    original_content = content
+
+    # If it's a link, check if it's a Telegram username link
+    if ctype == "link":
+        match = TELEGRAM_LINK_REGEX.match(content)
+        if match:
+            content = match.group(4).lower() # Extract username
+            ctype = "username"
+            logger.info(f"Normalized link '{original_content}' to username '{content}'")
+        elif content.lower().startswith("www."):
+            content = "https://" + content
+
+    # If it's a username, ensure it's clean
     elif ctype == "username":
         content = content.lower().lstrip('@')
 
@@ -1653,35 +1666,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skipped = 0
     
     for content, content_type in all_content:
-        # Normalize content
-        if content_type == "link" and content.lower().startswith("www."):
-            content = "https://" + content
-        elif content_type == "username":
-            content = content.lower()
-        
-        try:
-            conn.execute(
-                "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                (content, content_type, dt.datetime.now(dt.timezone.utc).isoformat())
-            )
-            
-            # Write to file
-            bytes_written = write_content_to_file(p, content, content_type, fmt)
-            
-            # Update stats
-            incr_stat(conn, "content_total", 1)
-            if content_type == "link":
-                incr_stat(conn, "links_saved", 1)
-            else:
-                incr_stat(conn, "usernames_saved", 1)
-            
-            added += 1
-            
-        except sqlite3.IntegrityError:
-            # Duplicate found
-            save_duplicate(chat_id, content, content_type, conn)
-            incr_stat(conn, "dups_total", 1)
-            skipped += 1
+        a, s = _add_content_to_db(conn, chat_id, p, fmt, content, content_type)
+        added += a
+        skipped += s
     
     conn.commit()
     
