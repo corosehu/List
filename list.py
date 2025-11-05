@@ -1317,62 +1317,48 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_guard(update, context):
-        return
-
-    if not context.user_data.get("expecting_upload"):
+    """Handles the file upload process by dispatching to specialized parsers."""
+    if not await admin_guard(update, context) or not context.user_data.get("expecting_upload"):
         return
 
     document = update.effective_message.document
     chat_id = update.effective_chat.id
 
     if not document:
-        logger.warning(f"User {chat_id} sent an invalid document.")
         await update.message.reply_text("❌ Please send a valid file.")
         return
 
     file_name = document.file_name
     file_ext = Path(file_name).suffix.lower()
-    logger.info(f"Received file upload '{file_name}' from user {chat_id}.")
 
     if file_ext not in (".txt", ".csv"):
-        logger.warning(f"Unsupported file type '{file_ext}' from user {chat_id}.")
         await update.message.reply_text("❌ Only `.txt` or `.csv` files are supported.")
         return
+
+    # Acknowledge and set status to 'processing'
+    processing_message = await update.message.reply_text("🔄 Processing your file, please wait...")
 
     conn = connect_db(chat_id)
     try:
         file = await document.get_file()
         temp_path = DATA_DIR / f"temp_upload_{chat_id}_{document.file_unique_id}{file_ext}"
         await file.download_to_drive(temp_path)
-        logger.info(f"File downloaded to temporary path: {temp_path}")
 
         current_file, current_fmt = read_current_file(chat_id)
-        current_fmt = current_fmt if current_fmt in ("txt", "csv") else "txt"
         if not current_file:
             current_file = next_file_name(chat_id, current_fmt)
             set_current_file(chat_id, current_file, current_fmt)
-            logger.info(f"No current file found. Created new file: {current_file.name}")
 
         current_file.touch(exist_ok=True)
         ensure_file_not_empty(current_file, current_fmt)
 
-        added = 0
-        skipped = 0
-        processed_lines = 0
+        added, skipped, processed = 0, 0, 0
+        parsing_mode = "Generic Text File"
+        title = "File Restore Complete"
 
-        parsing_mode = "line-by-line"
-
-        # --- Smart Parsing Logic ---
         with temp_path.open("r", encoding="utf-8", newline="") as f:
             lines = f.readlines()
-            # Log first 10 lines for debugging
-            logger.info(f"--- First 10 lines of {file_name} ---")
-            for i, line in enumerate(lines[:10]):
-                logger.info(f"Line {i+1}: {line.strip()}")
-            logger.info("---------------------------------------")
-
-            f.seek(0) # Reset file pointer after reading lines
+            f.seek(0)
 
             if file_ext == ".csv":
                 try:
@@ -1380,95 +1366,30 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                     f.seek(0)
                     reader = csv.DictReader(f)
 
-                    is_group_export = "username" in header and "name" in header
-                    is_links_file = "content" in header and "type" in header
-
-                    if is_group_export:
-                        parsing_mode = "Group Export CSV"
-                        logger.info("Parsing file as a Group Export CSV.")
-                        for row in reader:
-                            processed_lines += 1
-                            username = row.get("username", "").strip()
-                            if not username:
-                                continue
-
-                            # Add both the link and the username
-                            to_add = [
-                                (f"https://t.me/{username}", "link"),
-                                (f"@{username}", "username")
-                            ]
-                            for content, ctype in to_add:
-                                a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
-                                added += a
-                                skipped += s
-
-                    elif is_links_file:
-                        parsing_mode = "Bot Data File (CSV)"
-                        logger.info("Parsing file as a Bot Data File (CSV).")
-                        for row in reader:
-                            processed_lines += 1
-                            content = row.get("content", "").strip()
-                            ctype = row.get("type", "").strip()
-                            if not content or ctype not in ("link", "username"):
-                                continue
-                            a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
-                            added += a
-                            skipped += s
-
+                    if "username" in header and "name" in header:
+                        parsing_mode = "Group Import"
+                        title = "Group Import Complete"
+                        added, skipped, processed = _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt)
+                    elif "content" in header and "type" in header:
+                        parsing_mode = "Bot Data File"
+                        added, skipped, processed = _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt)
                     else:
-                        logger.warning(f"Unknown CSV format with header: {header}. Falling back to line-by-line parsing.")
-                        # Fallback is handled by the generic parser below
+                        added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
 
                 except (StopIteration, csv.Error):
-                    logger.warning("Could not parse CSV header. Falling back to line-by-line parsing.")
-                    # Fallback is handled by the generic parser below
-
-            # --- Fallback Line-by-Line Parser for TXT and Unknown CSVs ---
-            if parsing_mode == "line-by-line":
-                logger.info("Parsing file with line-by-line regex mode.")
-                for i, line in enumerate(lines):
-                    processed_lines += 1
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-
-                    contents_to_add = []
-                    links = [m.group(1) for m in URL_REGEX.finditer(line)]
-                    usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
-
-                    for link in links:
-                        contents_to_add.append((link, "link"))
-                    for username in usernames:
-                        contents_to_add.append((username, "username"))
-
-                    if not links and not usernames:
-                        potential_username = line.lstrip('@')
-                        if ' ' not in potential_username and '.' not in potential_username and '/' not in potential_username and ':' not in potential_username:
-                            if 5 <= len(potential_username) <= 32 and all(c.isalnum() or c == '_' for c in potential_username):
-                                contents_to_add.append((potential_username, "username"))
-
-                    if not contents_to_add:
-                        logger.warning(f"Line {i+1}: Could not parse content from line: '{line}'")
-                        continue
-
-                    for content, ctype in contents_to_add:
-                        a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
-                        added += a
-                        skipped += s
+                    added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
+            else: # .txt file
+                added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
 
         conn.commit()
-        logger.info(f"File processing complete. Mode: {parsing_mode}. Processed: {processed_lines}, Added: {added}, Skipped: {skipped}")
-        conn.close()
-        temp_path.unlink(missing_ok=True)
-        context.user_data["expecting_upload"] = False
+        total = get_stat(conn, "content_total")
 
-        total = get_stat(connect_db(chat_id), "content_total")
-
-        await update.message.reply_text(
-            f"✅ **Upload and Restore Complete**\n\n"
+        # --- Refined User Message ---
+        await processing_message.edit_text(
+            f"✅ **{title}**\n\n"
             f"**File Summary:**\n"
             f"• Parsing Mode: `{parsing_mode}`\n"
-            f"• Lines/Rows Processed: {processed_lines:,}\n"
+            f"• Lines/Rows Processed: {processed:,}\n"
             f"• New Items Added: {added:,}\n"
             f"• Duplicates Skipped: {skipped:,}\n\n"
             f"**Database Status:**\n"
@@ -1480,17 +1401,19 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
     except Exception as e:
         logger.error(f"Upload failed for user {chat_id} with file '{file_name}': {traceback.format_exc()}")
-        await update.message.reply_text(
+        await processing_message.edit_text(
             f"❌ **Upload Failed**\n\nAn unexpected error occurred: `{str(e)}`\n\nPlease check the bot logs for more details.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
+    finally:
+        conn.close()
         if "temp_path" in locals() and temp_path.exists():
             temp_path.unlink(missing_ok=True)
         context.user_data["expecting_upload"] = False
 
 def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype):
-    """Helper to add content to DB and file, returns (added, skipped)."""
+    """Helper to add a single piece of content to the DB and file, returns (added, skipped)."""
     if not content:
         return 0, 0
 
@@ -1515,6 +1438,77 @@ def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
         save_duplicate(chat_id, content, ctype, conn)
         incr_stat(conn, "dups_total", 1)
         return 0, 1
+
+def _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+    """Parses a CSV file from the bot's group export feature."""
+    added, skipped, processed = 0, 0, 0
+    logger.info("Parsing file as a Group Export CSV.")
+    for row in reader:
+        processed += 1
+        username = row.get("username", "").strip()
+        if not username:
+            continue
+
+        to_add = [
+            (f"https://t.me/{username}", "link"),
+            (f"@{username}", "username")
+        ]
+        for content, ctype in to_add:
+            a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
+            added += a
+            skipped += s
+    return added, skipped, processed
+
+def _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+    """Parses a CSV file from the bot's own data file format."""
+    added, skipped, processed = 0, 0, 0
+    logger.info("Parsing file as a Bot Data File (CSV).")
+    for row in reader:
+        processed += 1
+        content = row.get("content", "").strip()
+        ctype = row.get("type", "").strip()
+        if not content or ctype not in ("link", "username"):
+            continue
+        a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
+        added += a
+        skipped += s
+    return added, skipped, processed
+
+def _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+    """Parses a generic text file line by line using regex."""
+    added, skipped, processed = 0, 0, 0
+    logger.info("Parsing file with line-by-line regex mode.")
+    for i, line in enumerate(lines):
+        processed += 1
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        contents_to_add = []
+        links = [m.group(1) for m in URL_REGEX.finditer(line)]
+        usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
+
+        for link in links:
+            contents_to_add.append((link, "link"))
+        for username in usernames:
+            contents_to_add.append((username, "username"))
+
+        if not links and not usernames:
+            potential_username = line.lstrip('@')
+            if ' ' not in potential_username and '.' not in potential_username and '/' not in potential_username and ':' not in potential_username:
+                if 5 <= len(potential_username) <= 32 and all(c.isalnum() or c == '_' for c in potential_username):
+                    contents_to_add.append((potential_username, "username"))
+
+        if not contents_to_add:
+            logger.warning(f"Line {i+1}: Could not parse content from line: '{line}'")
+            continue
+
+        for content, ctype in contents_to_add:
+            a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
+            added += a
+            skipped += s
+    return added, skipped, processed
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_guard(update, context):
         return
