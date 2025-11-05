@@ -22,6 +22,7 @@ Author: Enhanced Version
 import asyncio
 import csv
 import datetime as dt
+from datetime import timezone
 import os
 import re
 import sqlite3
@@ -268,10 +269,10 @@ def ensure_file_not_empty(file_path: Path, fmt: str) -> None:
             if fmt == "csv":
                 writer = csv.writer(f)
                 writer.writerow(["content", "type", "added_at"])
-                writer.writerow(["[Empty File]", "placeholder", dt.datetime.utcnow().isoformat()])
+                writer.writerow(["[Empty File]", "placeholder", dt.datetime.now(dt.timezone.utc).isoformat()])
             else:
                 f.write("# Links and Usernames File\n")
-                f.write(f"# Created: {dt.datetime.utcnow().isoformat()}\n")
+                f.write(f"# Created: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
                 f.write("# No content yet\n")
 
 def write_content_to_file(path: Path, content: str, content_type: str, fmt: str) -> int:
@@ -282,11 +283,11 @@ def write_content_to_file(path: Path, content: str, content_type: str, fmt: str)
             w = csv.writer(f)
             if new_file:
                 w.writerow(["content", "type", "added_at"])
-            ts = dt.datetime.utcnow().isoformat()
+            ts = dt.datetime.now(dt.timezone.utc).isoformat()
             w.writerow([content, content_type, ts])
             return len(content) + len(content_type) + len(ts) + 10
     else:
-        line = f"{content} ({content_type}) - {dt.datetime.utcnow().isoformat()}\n"
+        line = f"{content} ({content_type}) - {dt.datetime.now(dt.timezone.utc).isoformat()}\n"
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
         return len(line.encode("utf-8"))
@@ -296,7 +297,7 @@ def save_duplicate(chat_id: int, content: str, content_type: str, conn: sqlite3.
     # Save to database
     conn.execute(
         "INSERT INTO duplicates(content, type, seen_at, duplicate_count) VALUES(?,?,?,1)",
-        (content, content_type, dt.datetime.utcnow().isoformat())
+        (content, content_type, dt.datetime.now(dt.timezone.utc).isoformat())
     )
     
     # Save to duplicate file
@@ -309,10 +310,10 @@ def save_duplicate(chat_id: int, content: str, content_type: str, conn: sqlite3.
             w = csv.writer(f)
             if new_file:
                 w.writerow(["content", "type", "duplicate_found_at"])
-            w.writerow([content, content_type, dt.datetime.utcnow().isoformat()])
+            w.writerow([content, content_type, dt.datetime.now(dt.timezone.utc).isoformat()])
     else:
         with dup_path.open("a", encoding="utf-8") as f:
-            f.write(f"{content} ({content_type}) - Duplicate at {dt.datetime.utcnow().isoformat()}\n")
+            f.write(f"{content} ({content_type}) - Duplicate at {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
 
 def format_bytes(n: int) -> str:
     """Format bytes to human readable."""
@@ -400,8 +401,8 @@ async def save_user_credentials(chat_id: int, user_id: int, data: Dict[str, Any]
             data.get('session_string'),
             data.get('phone_number'),
             data.get('login_state', LoginState.IDLE.name),
-            data.get('created_at', dt.datetime.utcnow().isoformat()),
-            dt.datetime.utcnow().isoformat()
+            data.get('created_at', dt.datetime.now(dt.timezone.utc).isoformat()),
+            dt.datetime.now(dt.timezone.utc).isoformat()
         )
     )
     conn.commit()
@@ -677,7 +678,7 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
                         "members_count": getattr(entity, 'participants_count', 'N/A'),
                         "type": "Channel" if dialog.is_channel else "Group",
                         "is_public": bool(username),
-                        "exported_at": dt.datetime.utcnow().isoformat()
+                        "exported_at": dt.datetime.now(dt.timezone.utc).isoformat()
                     }
                     groups.append(group_info)
                     result["success_count"] += 1
@@ -695,7 +696,7 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
                     "name": getattr(dialog, 'name', 'Unknown'),
                     "id": getattr(dialog, 'id', 'Unknown'),
                     "error": str(e),
-                    "failed_at": dt.datetime.utcnow().isoformat()
+                    "failed_at": dt.datetime.now(dt.timezone.utc).isoformat()
                 }
                 failed_groups.append(failed_info)
                 result["failed_count"] += 1
@@ -726,7 +727,7 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
             links_file = export_dir / f"group_links_{timestamp}.txt"
             with links_file.open("w", encoding="utf-8") as f:
                 f.write("# Group Links and Usernames Export\n")
-                f.write(f"# Exported: {dt.datetime.utcnow().isoformat()}\n")
+                f.write(f"# Exported: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
                 f.write(f"# Total Groups: {result['success_count']}\n")
                 f.write("#" + "="*50 + "\n\n")
                 
@@ -763,7 +764,7 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (
                     user_id,
-                    dt.datetime.utcnow().isoformat(),
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
                     result["groups_count"],
                     result["success_count"],
                     result["failed_count"],
@@ -781,7 +782,7 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
                    VALUES (?,?,?,?,?,?,?,?)""",
                 (
                     user_id,
-                    dt.datetime.utcnow().isoformat(),
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
                     result["groups_count"],
                     result["success_count"],
                     result["failed_count"],
@@ -1240,7 +1241,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 conn.execute(
                     "INSERT INTO files(path, created_at, link_count, bytes, format) VALUES(?,?,?,?,?)",
-                    (str(p), dt.datetime.utcnow().isoformat(), 0, 0, fmt)
+                    (str(p), dt.datetime.now(dt.timezone.utc).isoformat(), 0, 0, fmt)
                 )
                 incr_stat(conn, "files_total", 1)
                 conn.commit()
@@ -1274,7 +1275,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 conn.execute(
                     "INSERT INTO files(path, created_at, link_count, bytes, format) VALUES(?,?,?,?,?)",
-                    (str(p), dt.datetime.utcnow().isoformat(), 0, 0, fmt)
+                    (str(p), dt.datetime.now(dt.timezone.utc).isoformat(), 0, 0, fmt)
                 )
                 incr_stat(conn, "files_total", 1)
                 conn.commit()
@@ -1348,7 +1349,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                     try:
                         conn.execute(
                             "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                            (content, ctype, dt.datetime.utcnow().isoformat())
+                            (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
                         )
                         write_content_to_file(current_file, content, ctype, current_fmt)
                         incr_stat(conn, "content_total", 1)
@@ -1381,7 +1382,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                             try:
                                 conn.execute(
                                     "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                                    (content, ctype, dt.datetime.utcnow().isoformat())
+                                    (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
                                 )
                                 write_content_to_file(current_file, content, ctype, current_fmt)
                                 incr_stat(conn, "content_total", 1)
@@ -1464,7 +1465,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_current_file(chat_id, p, fmt)
         conn.execute(
             "INSERT INTO files(path, created_at, link_count, bytes, format) VALUES(?,?,?,?,?)",
-            (str(p), dt.datetime.utcnow().isoformat(), 0, 0, fmt)
+            (str(p), dt.datetime.now(dt.timezone.utc).isoformat(), 0, 0, fmt)
         )
     
     added = 0
@@ -1480,7 +1481,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             conn.execute(
                 "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                (content, content_type, dt.datetime.utcnow().isoformat())
+                (content, content_type, dt.datetime.now(dt.timezone.utc).isoformat())
             )
             
             # Write to file
@@ -1517,7 +1518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"**Total Statistics:**\n"
         f"• Saved: {total_content:,}\n"
         f"• Duplicates: {dups:,}\n\n"
-        f"Current file: {p.name}"
+        f"Current file: `{p.name}`"
     )
     
     await update.effective_message.reply_text(
