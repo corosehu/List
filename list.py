@@ -786,7 +786,6 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
                     # Collect links and usernames
                     if username:
                         all_links.append(f"https://t.me/{username}")
-                        all_links.append(f"@{username}")
                     
                     # Small delay to avoid rate limits
                     await asyncio.sleep(0.1)
