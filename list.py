@@ -1335,16 +1335,44 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = connect_db(chat_id)
             
             if data == "dl_current":
-                p, fmt = read_current_file(chat_id)
-                if not p or not p.exists():
-                    await q.edit_message_text("No current file available.")
-                else:
-                    ensure_file_not_empty(p, fmt)
-                    await q.message.reply_document(
-                        document=InputFile(p.open("rb"), filename=p.name),
-                        caption=f"📄 Current file: {p.name}"
-                    )
-                    
+                await q.edit_message_text("🔄 Generating your full data export... please wait.")
+
+                export_dir = ensure_chat_dirs(chat_id) / "exports"
+                _, fmt = read_current_file(chat_id)
+                timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                export_file = export_dir / f"Full_Export_{timestamp}.{fmt}"
+
+                all_content = conn.execute("SELECT content, type FROM links ORDER BY added_at ASC").fetchall()
+
+                if not all_content:
+                    await q.edit_message_text("❌ No data found in the database to export.")
+                    return
+
+                with export_file.open("w", encoding="utf-8", newline="") as f:
+                    if fmt == "csv":
+                        writer = csv.writer(f)
+                        writer.writerow(["content", "type"])
+                        for content, ctype in all_content:
+                            writer.writerow([content, ctype])
+                    else: # txt
+                        f.write(f"# Full Data Export - {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+                        f.write(f"# Total Items: {len(all_content)}\n\n")
+                        for content, ctype in all_content:
+                            # Reconstruct a readable format for txt
+                            if ctype == "username":
+                                f.write(f"@{content}\n")
+                            else:
+                                f.write(f"{content}\n")
+
+                await q.message.reply_document(
+                    document=InputFile(export_file.open("rb"), filename=f"Full_Data_Export.{fmt}"),
+                    caption=f"✅ **Full Data Export**\n\n"
+                            f"• Total Items: {len(all_content):,}\n"
+                            f"• Format: {fmt.upper()}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await q.delete_message() # remove "Generating..." message
+
             elif data == "new_file":
                 _, fmt = read_current_file(chat_id)
                 p = next_file_name(chat_id, fmt)
