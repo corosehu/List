@@ -93,12 +93,17 @@ MAX_BYTES_PER_FILE = int(os.getenv("MAX_BYTES_PER_FILE", str(50 * 1024 * 1024)))
 # Login States
 class LoginState(Enum):
     IDLE = 0
+    # Phone-based login
     WAITING_API_ID = 1
     WAITING_API_HASH = 2
     WAITING_PHONE = 3
     WAITING_CODE = 4
     WAITING_2FA = 5
     LOGGED_IN = 6
+    # Session-based login
+    SESSION_WAITING_API_ID = 7
+    SESSION_WAITING_API_HASH = 8
+    SESSION_WAITING_STRING = 9
 
 # Regex patterns
 URL_REGEX = re.compile(
@@ -381,6 +386,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
 def login_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔐 Start Login Process", callback_data="start_login")],
+        [InlineKeyboardButton("🔑 Login with Session String", callback_data="session_login")],
         [InlineKeyboardButton("📋 Check Login Status", callback_data="login_status")],
         [InlineKeyboardButton("🔄 Reset Login", callback_data="reset_login")],
         [InlineKeyboardButton("◀️ Back to Main", callback_data="back_main")]
@@ -627,6 +633,87 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
                 
             except Exception as e:
                 await update.message.reply_text(f"❌ 2FA login failed: {str(e)}")
+                context.user_data.clear()
+
+        # --- Session String Login Flow ---
+        elif login_state == LoginState.SESSION_WAITING_API_ID:
+            if not text.isdigit():
+                await update.message.reply_text("❌ Invalid API ID. Please enter numbers only.")
+                return
+            context.user_data['api_id'] = text
+            context.user_data['login_state'] = LoginState.SESSION_WAITING_API_HASH
+            await update.message.reply_text(
+                "✅ API ID saved.\n\n"
+                "Step 2/3: **API Hash**\n\n"
+                "Now enter your API Hash:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        elif login_state == LoginState.SESSION_WAITING_API_HASH:
+            if len(text) != 32:
+                await update.message.reply_text("❌ Invalid API Hash. It should be 32 characters.")
+                return
+            context.user_data['api_hash'] = text
+            context.user_data['login_state'] = LoginState.SESSION_WAITING_STRING
+            await update.message.reply_text(
+                "✅ API Hash saved.\n\n"
+                "Step 3/3: **Session String**\n\n"
+                "Now paste your full Telethon session string:",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        elif login_state == LoginState.SESSION_WAITING_STRING:
+            session_string = text
+            api_id = context.user_data.get('api_id')
+            api_hash = context.user_data.get('api_hash')
+
+            if not all([api_id, api_hash, session_string]):
+                await update.message.reply_text("❌ Session validation failed: Missing credentials. Please restart.")
+                context.user_data.clear()
+                return
+
+            client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    await update.message.reply_text(
+                        "❌ **Session Invalid or Expired**\n\nPlease check your session string and try again.",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=login_keyboard()
+                    )
+                    context.user_data.clear()
+                    return
+
+                me = await client.get_me()
+                phone = me.phone
+                username = me.username or "N/A"
+
+                await save_user_credentials(chat_id, user_id, {
+                    'api_id': api_id,
+                    'api_hash': api_hash,
+                    'session_string': session_string,
+                    'phone_number': phone,
+                    'login_state': LoginState.LOGGED_IN.name
+                })
+
+                await update.message.reply_text(
+                    f"✅ **Session Login Successful!**\n\n"
+                    f"Logged in as:\n"
+                    f"• User: @{username}\n"
+                    f"• Phone: +{phone}\n\n"
+                    "You can now export your groups.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=export_keyboard()
+                )
+
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ **Session Validation Failed**\n\nError: `{str(e)}`\n\nPlease check your credentials and session string.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            finally:
+                if client.is_connected():
+                    await client.disconnect()
                 context.user_data.clear()
                 
     except Exception as e:
@@ -976,10 +1063,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "start_login":
             context.user_data['login_state'] = LoginState.WAITING_API_ID
             await q.edit_message_text(
-                "🔐 **Login Process Started**\n\n"
-                "Step 1/5: **API ID**\n\n"
+                "🔐 **Phone Login Process**\n\n"
+                "Step 1/3: **API ID**\n\n"
                 "Please enter your API ID:\n"
                 "(Get it from https://my.telegram.org)",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        elif data == "session_login":
+            context.user_data['login_state'] = LoginState.SESSION_WAITING_API_ID
+            await q.edit_message_text(
+                "🔑 **Session String Login**\n\n"
+                "Step 1/3: **API ID**\n\n"
+                "Please enter your API ID:",
                 parse_mode=ParseMode.MARKDOWN
             )
             
