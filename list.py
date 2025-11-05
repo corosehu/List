@@ -1321,7 +1321,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if not context.user_data.get("expecting_upload"):
-        return  # Ignore random docs
+        return
 
     document = update.effective_message.document
     chat_id = update.effective_chat.id
@@ -1342,7 +1342,6 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
     conn = connect_db(chat_id)
     try:
-        # Get file
         file = await document.get_file()
         temp_path = DATA_DIR / f"temp_upload_{chat_id}_{document.file_unique_id}{file_ext}"
         await file.download_to_drive(temp_path)
@@ -1360,163 +1359,89 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
         added = 0
         skipped = 0
+        processed_lines = 0
 
-        logger.info(f"Starting to process file '{file_name}' with format '{file_ext}'")
-        if file_ext == ".csv":
-            with temp_path.open("r", encoding="utf-8", newline="") as f:
-                try:
-                    header = next(csv.reader(f))
-                    f.seek(0)
-                    reader = csv.DictReader(f)
-                    logger.info(f"CSV header detected: {header}")
-                except StopIteration:
-                    logger.warning("Uploaded CSV file is empty.")
-                    header = []
-                    reader = []
+        logger.info(f"Starting to process file '{file_name}' with simplified logic.")
 
-                is_group_export = "username" in header and "name" in header
-                is_links_file = "content" in header and "type" in header
-                logger.info(f"CSV type detection: is_group_export={is_group_export}, is_links_file={is_links_file}")
+        with temp_path.open("r", encoding="utf-8") as f:
+            # --- High-Detail Logging: Log first 10 lines ---
+            lines = f.readlines()
+            logger.info(f"--- First 10 lines of {file_name} ---")
+            for i, line in enumerate(lines[:10]):
+                logger.info(f"Line {i+1}: {line.strip()}")
+            logger.info("---------------------------------------")
 
-                if is_links_file:
-                    for i, row in enumerate(reader):
-                        content = row.get("content", "").strip()
-                        ctype = row.get("type", "").strip()
-                        if not content or ctype not in ("link", "username"):
-                            logger.debug(f"Row {i+1}: Skipping invalid row: {row}")
-                            continue
-                        if ctype == "username":
-                            content = content.lower()
-                        try:
-                            conn.execute(
-                                "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                                (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
-                            )
-                            write_content_to_file(current_file, content, ctype, current_fmt)
-                            incr_stat(conn, "content_total", 1)
-                            if ctype == "link":
-                                incr_stat(conn, "links_saved", 1)
-                            else:
-                                incr_stat(conn, "usernames_saved", 1)
-                            added += 1
-                        except sqlite3.IntegrityError:
-                            save_duplicate(chat_id, content, ctype, conn)
-                            incr_stat(conn, "dups_total", 1)
-                            skipped += 1
-                elif is_group_export:
-                    for i, row in enumerate(reader):
-                        username = row.get("username", "").strip()
-                        if not username:
-                            logger.debug(f"Row {i+1}: Skipping group with no username: {row}")
-                            continue
+            # --- Overhauled Parsing Logic ---
+            for i, line in enumerate(lines):
+                processed_lines += 1
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
 
-                        contents_to_add = [
-                            (f"https://t.me/{username}", "link"),
-                            (f"@{username}", "username")
-                        ]
+                contents_to_add = []
 
-                        for content, ctype in contents_to_add:
-                            if ctype == "username":
-                                content = content.lower()
-                            try:
-                                conn.execute(
-                                    "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                                    (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
-                                )
-                                write_content_to_file(current_file, content, ctype, current_fmt)
-                                incr_stat(conn, "content_total", 1)
-                                if ctype == "link":
-                                    incr_stat(conn, "links_saved", 1)
-                                else:
-                                    incr_stat(conn, "usernames_saved", 1)
-                                added += 1
-                            except sqlite3.IntegrityError:
-                                save_duplicate(chat_id, content, ctype, conn)
-                                incr_stat(conn, "dups_total", 1)
-                                skipped += 1
-                else:
-                    logger.warning(f"CSV file '{file_name}' has an unknown format. Header: {header}")
+                # Regex to find all potential links and usernames in the line
+                links = [m.group(1) for m in URL_REGEX.finditer(line)]
+                usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
 
-        else:  # .txt
-            with temp_path.open("r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        logger.debug(f"Line {i+1}: Skipping comment or empty line.")
-                        continue
+                for link in links:
+                    contents_to_add.append((link, "link"))
+                for username in usernames:
+                    contents_to_add.append((username, "username"))
 
-                    logger.debug(f"Line {i+1}: Processing raw line: '{line}'")
-                    contents_to_add = []
+                # If no links or usernames are found via regex, check if the whole line is a username
+                if not links and not usernames:
+                    potential_username = line.lstrip('@')
+                    # Basic validation for a username if it's the only thing on the line
+                    if ' ' not in potential_username and '.' not in potential_username and '/' not in potential_username and ':' not in potential_username:
+                         if 5 <= len(potential_username) <= 32 and all(c.isalnum() or c == '_' for c in potential_username):
+                            contents_to_add.append((potential_username, "username"))
 
-                    if " (" in line and ") - " in line:
-                        try:
-                            content_part, rest = line.split(" (", 1)
-                            ctype_part, _ = rest.split(") - ", 1)
-                            if ctype_part in ("link", "username"):
-                                contents_to_add.append((content_part, ctype_part))
-                                logger.debug(f"Line {i+1}: Parsed as detailed format: content='{content_part}', type='{ctype_part}'")
-                        except Exception:
-                            logger.debug(f"Line {i+1}: Failed to parse as detailed format, will treat as simple content.")
-                            pass
+                if not contents_to_add:
+                    logger.warning(f"Line {i+1}: Could not parse content from line: '{line}'")
+                    continue
 
-                    if not contents_to_add:
-                        links = [m.group(1) for m in URL_REGEX.finditer(line)]
-                        usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
+                for content, ctype in contents_to_add:
+                    if ctype == "link" and content.lower().startswith("www."):
+                        content = "https://" + content
+                    elif ctype == "username":
+                        content = content.lower().lstrip('@') # Ensure no @ is stored
 
-                        for link in links:
-                            contents_to_add.append((link, "link"))
-                        for username in usernames:
-                            contents_to_add.append((username, "username"))
-
-                        if not links and not usernames:
-                            line_content = line.strip()
-                            if ' ' not in line_content and '.' not in line_content and '/' not in line_content and ':' not in line_content:
-                                potential_username = line_content.lstrip('@')
-                                if 5 <= len(potential_username) <= 32 and \
-                                   potential_username and potential_username[0].isalpha() and \
-                                   all(c.isalnum() or c == '_' for c in potential_username):
-                                    contents_to_add.append((potential_username, "username"))
-
-                    if not contents_to_add:
-                        logger.debug(f"Line {i+1}: No content found to add after parsing.")
-
-                    for content, ctype in contents_to_add:
-                        if ctype == "link" and content.lower().startswith("www."):
-                            content = "https://" + content
-                        elif ctype == "username":
-                            content = content.lower()
-
-                        try:
-                            conn.execute(
-                                "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                                (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
-                            )
-                            write_content_to_file(current_file, content, ctype, current_fmt)
-                            incr_stat(conn, "content_total", 1)
-                            if ctype == "link":
-                                incr_stat(conn, "links_saved", 1)
-                            else:
-                                incr_stat(conn, "usernames_saved", 1)
-                            added += 1
-                        except sqlite3.IntegrityError:
-                            save_duplicate(chat_id, content, ctype, conn)
-                            incr_stat(conn, "dups_total", 1)
-                            skipped += 1
+                    try:
+                        conn.execute(
+                            "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
+                            (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
+                        )
+                        write_content_to_file(current_file, content, ctype, current_fmt)
+                        incr_stat(conn, "content_total", 1)
+                        if ctype == "link":
+                            incr_stat(conn, "links_saved", 1)
+                        else:
+                            incr_stat(conn, "usernames_saved", 1)
+                        added += 1
+                    except sqlite3.IntegrityError:
+                        save_duplicate(chat_id, content, ctype, conn)
+                        incr_stat(conn, "dups_total", 1)
+                        skipped += 1
 
         conn.commit()
-        logger.info(f"File processing complete. Added: {added}, Skipped: {skipped}")
+        logger.info(f"File processing complete. Processed: {processed_lines}, Added: {added}, Skipped: {skipped}")
         conn.close()
         temp_path.unlink(missing_ok=True)
         context.user_data["expecting_upload"] = False
 
         total = get_stat(connect_db(chat_id), "content_total")
 
+        # --- Refined User Message ---
         await update.message.reply_text(
-            f"✅ **Upload Complete**\n"
-            f"• Added: {added}\n"
-            f"• Duplicates: {skipped}\n"
-            f"• Total Saved Now: {total:,}\n"
-            f"Current file updated: `{current_file.name}`",
+            f"✅ **Upload and Restore Complete**\n\n"
+            f"**File Summary:**\n"
+            f"• Lines Processed: {processed_lines:,}\n"
+            f"• New Items Added: {added:,}\n"
+            f"• Duplicates Skipped: {skipped:,}\n\n"
+            f"**Database Status:**\n"
+            f"• Total Saved Items: {total:,}\n\n"
+            f"Current file `{current_file.name}` has been updated.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
@@ -1524,7 +1449,8 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.error(f"Upload failed for user {chat_id} with file '{file_name}': {traceback.format_exc()}")
         await update.message.reply_text(
-            f"❌ Upload failed: An unexpected error occurred. Please check the logs.",
+            f"❌ **Upload Failed**\n\nAn unexpected error occurred: `{str(e)}`\n\nPlease check the bot logs for more details.",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
         if "temp_path" in locals() and temp_path.exists():
