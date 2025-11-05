@@ -82,7 +82,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8118285986:AAGFGuH_-i3y24Ig5j84eloIIpqFyBCXz9Y")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = {6827291977}  # Your Telegram user IDs
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -378,7 +378,10 @@ def main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 Use CSV", callback_data="fmt_csv"),
             InlineKeyboardButton("📝 Use TXT", callback_data="fmt_txt")
         ],
-        [InlineKeyboardButton("🔄 Download Duplicates", callback_data="dl_duplicates")],
+        [
+            InlineKeyboardButton("🔄 Download Duplicates", callback_data="dl_duplicates"),
+            InlineKeyboardButton("🧹 Clean Duplicates", callback_data="clean_duplicates")
+        ],
         [InlineKeyboardButton("👤 Telegram Account Login", callback_data="tg_login")]
     ]
     
@@ -1426,7 +1429,63 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=main_keyboard()
                 )
+
+            elif data == "clean_duplicates":
+                await q.edit_message_text("🔄 Scanning database and cleaning duplicates... This may take a moment.")
                 
+                # Use a separate connection for the cleanup process
+                cleanup_conn = connect_db(chat_id)
+                try:
+                    all_entries = cleanup_conn.execute("SELECT content, type FROM links").fetchall()
+
+                    seen = set()
+                    duplicates_to_delete = []
+
+                    initial_count = len(all_entries)
+
+                    for content, ctype in all_entries:
+                        # Normalize the content to find true duplicates
+                        normalized_content = content.lower().lstrip('@')
+                        match = TELEGRAM_LINK_REGEX.match(content)
+                        if match:
+                            normalized_content = match.group(4).lower()
+
+                        if normalized_content in seen:
+                            duplicates_to_delete.append(content)
+                        else:
+                            seen.add(normalized_content)
+
+                    if duplicates_to_delete:
+                        cleanup_conn.executemany("DELETE FROM links WHERE content = ?", [(d,) for d in duplicates_to_delete])
+                        cleanup_conn.commit()
+
+                    # Recalculate stats
+                    remaining_entries = cleanup_conn.execute("SELECT type FROM links").fetchall()
+                    new_total = len(remaining_entries)
+                    new_links = sum(1 for row in remaining_entries if row[0] == 'link')
+                    new_usernames = new_total - new_links
+
+                    cleanup_conn.execute("INSERT OR REPLACE INTO stats(k, v) VALUES(?, ?)", ("content_total", new_total))
+                    cleanup_conn.execute("INSERT OR REPLACE INTO stats(k, v) VALUES(?, ?)", ("links_saved", new_links))
+                    cleanup_conn.execute("INSERT OR REPLACE INTO stats(k, v) VALUES(?, ?)", ("usernames_saved", new_usernames))
+                    cleanup_conn.commit()
+
+                    removed_count = initial_count - new_total
+
+                    await q.edit_message_text(
+                        f"✅ **Cleanup Complete!**\n\n"
+                        f"• Duplicates Removed: {removed_count:,}\n"
+                        f"• New Total Unique Items: {new_total:,}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=main_keyboard()
+                    )
+
+                except Exception as e:
+                    logger.error(f"Duplicate cleaning failed: {traceback.format_exc()}")
+                    await q.edit_message_text(f"❌ Cleanup failed: {e}", reply_markup=main_keyboard())
+                finally:
+                    cleanup_conn.close()
+
             conn.close()
             
     except Exception as e:
