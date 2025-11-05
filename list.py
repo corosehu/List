@@ -82,7 +82,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8118285986:AAGFGuH_-i3y24Ig5j84eloIIpqFyBCXz9Y")
 ADMIN_IDS = {6827291977}  # Your Telegram user IDs
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
