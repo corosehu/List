@@ -1438,6 +1438,20 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                         for username in usernames:
                             contents_to_add.append((username, "username"))
 
+                        # If no links or @usernames were found on the line,
+                        # check if the line itself could be a plain username.
+                        if not links and not usernames:
+                            line_content = line.strip()
+                            # Heuristic: if it's a single word without typical URL chars, treat as username.
+                            if ' ' not in line_content and '.' not in line_content and '/' not in line_content and ':' not in line_content:
+                                potential_username = line_content.lstrip('@')
+                                # Check against Telegram's username rules (approx)
+                                if 5 <= len(potential_username) <= 32 and \
+                                   potential_username and potential_username[0].isalpha() and \
+                                   all(c.isalnum() or c == '_' for c in potential_username):
+                                    contents_to_add.append((potential_username, "username"))
+
+
                     # Process all found content from the line
                     for content, ctype in contents_to_add:
                         if ctype == "link" and content.lower().startswith("www."):
