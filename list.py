@@ -1338,45 +1338,59 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
         if file_ext == ".csv":
             with temp_path.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    content = row.get("content", "").strip()
-                    ctype = row.get("type", "").strip()
-                    if not content or ctype not in ("link", "username"):
-                        continue
-                    if ctype == "username":
-                        content = content.lower()
-                    try:
-                        conn.execute(
-                            "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
-                            (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
-                        )
-                        write_content_to_file(current_file, content, ctype, current_fmt)
-                        incr_stat(conn, "content_total", 1)
-                        if ctype == "link":
-                            incr_stat(conn, "links_saved", 1)
-                        else:
-                            incr_stat(conn, "usernames_saved", 1)
-                        added += 1
-                    except sqlite3.IntegrityError:
-                        save_duplicate(chat_id, content, ctype, conn)
-                        incr_stat(conn, "dups_total", 1)
-                        skipped += 1
-        else:  # .txt
-            with temp_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    # Try to parse: "content (type) - timestamp"
-                    if " (" in line and ") - " in line:
+                # Peek at the header to determine file type
+                try:
+                    header = next(csv.reader(f))
+                    f.seek(0)  # Reset file pointer
+                    reader = csv.DictReader(f)
+                except StopIteration:  # Handle empty file
+                    header = []
+                    reader = []
+
+                # Check if it's a group export file (has 'username' and 'name')
+                # or a standard links file (has 'content' and 'type')
+                is_group_export = "username" in header and "name" in header
+                is_links_file = "content" in header and "type" in header
+
+                if is_links_file:
+                    for row in reader:
+                        content = row.get("content", "").strip()
+                        ctype = row.get("type", "").strip()
+                        if not content or ctype not in ("link", "username"):
+                            continue
+                        if ctype == "username":
+                            content = content.lower()
                         try:
-                            content_part, rest = line.split(" (", 1)
-                            ctype_part, _ = rest.split(") - ", 1)
-                            content = content_part
-                            ctype = ctype_part
-                            if ctype not in ("link", "username"):
-                                continue
+                            conn.execute(
+                                "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
+                                (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
+                            )
+                            write_content_to_file(current_file, content, ctype, current_fmt)
+                            incr_stat(conn, "content_total", 1)
+                            if ctype == "link":
+                                incr_stat(conn, "links_saved", 1)
+                            else:
+                                incr_stat(conn, "usernames_saved", 1)
+                            added += 1
+                        except sqlite3.IntegrityError:
+                            save_duplicate(chat_id, content, ctype, conn)
+                            incr_stat(conn, "dups_total", 1)
+                            skipped += 1
+
+                elif is_group_export:
+                    for row in reader:
+                        username = row.get("username", "").strip()
+                        if not username:
+                            continue
+
+                        # From one group username, we can generate a link and a @username
+                        # This list will hold tuples of (content, type)
+                        contents_to_add = [
+                            (f"https://t.me/{username}", "link"),
+                            (f"@{username}", "username")
+                        ]
+
+                        for content, ctype in contents_to_add:
                             if ctype == "username":
                                 content = content.lower()
                             try:
@@ -1395,8 +1409,58 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                                 save_duplicate(chat_id, content, ctype, conn)
                                 incr_stat(conn, "dups_total", 1)
                                 skipped += 1
+        else:  # .txt
+            with temp_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+
+                    contents_to_add = [] # List of (content, ctype) tuples
+
+                    # First, try to parse the detailed format: "content (type) - timestamp"
+                    if " (" in line and ") - " in line:
+                        try:
+                            content_part, rest = line.split(" (", 1)
+                            ctype_part, _ = rest.split(") - ", 1)
+                            if ctype_part in ("link", "username"):
+                                contents_to_add.append((content_part, ctype_part))
                         except Exception:
-                            continue  # Skip malformed lines
+                            pass # It's not the detailed format, so we'll try the simple format next.
+
+                    # If not parsed as detailed, treat as simple content from the raw line
+                    if not contents_to_add:
+                        links = [m.group(1) for m in URL_REGEX.finditer(line)]
+                        usernames = [m.group(1) for m in USERNAME_REGEX.finditer(line)]
+
+                        for link in links:
+                            contents_to_add.append((link, "link"))
+                        for username in usernames:
+                            contents_to_add.append((username, "username"))
+
+                    # Process all found content from the line
+                    for content, ctype in contents_to_add:
+                        if ctype == "link" and content.lower().startswith("www."):
+                            content = "https://" + content
+                        elif ctype == "username":
+                            content = content.lower()
+
+                        try:
+                            conn.execute(
+                                "INSERT INTO links(content, type, added_at) VALUES(?,?,?)",
+                                (content, ctype, dt.datetime.now(dt.timezone.utc).isoformat())
+                            )
+                            write_content_to_file(current_file, content, ctype, current_fmt)
+                            incr_stat(conn, "content_total", 1)
+                            if ctype == "link":
+                                incr_stat(conn, "links_saved", 1)
+                            else:
+                                incr_stat(conn, "usernames_saved", 1)
+                            added += 1
+                        except sqlite3.IntegrityError:
+                            save_duplicate(chat_id, content, ctype, conn)
+                            incr_stat(conn, "dups_total", 1)
+                            skipped += 1
 
         conn.commit()
         conn.close()
