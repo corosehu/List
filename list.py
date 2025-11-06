@@ -728,7 +728,7 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
 # === GROUP IMPORT ========
 # =========================
 
-async def import_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
+async def import_user_groups(chat_id: int, user_id: int, progress_callback: Optional[callable] = None) -> Dict[str, Any]:
     """Scans all user's groups and saves public links/usernames to the database."""
     result = {
         "success": False,
@@ -764,8 +764,9 @@ async def import_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
             set_current_file(chat_id, current_file, current_fmt)
 
         dialogs = await client.get_dialogs()
+        total_dialogs = len(dialogs)
         
-        for dialog in dialogs:
+        for i, dialog in enumerate(dialogs):
             result["groups_count"] += 1
             try:
                 if (dialog.is_group or dialog.is_channel) and dialog.entity.username:
@@ -789,6 +790,14 @@ async def import_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Could not process group '{dialog.name}': {e}")
                 result["failed_count"] += 1
+
+            # Update progress
+            if progress_callback and (i + 1) % 10 == 0:
+                await progress_callback(i + 1, total_dialogs)
+
+        # Final progress update
+        if progress_callback:
+            await progress_callback(total_dialogs, total_dialogs)
 
         conn.commit()
         conn.close()
@@ -1093,12 +1102,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            await q.edit_message_text("🔄 Processing... Please wait.")
+            processing_message = await q.edit_message_text("🔄 Processing... Please wait.")
             
-            result = await import_user_groups(chat_id, user_id)
+            async def progress_callback(current, total):
+                percentage = (current / total) * 100
+                try:
+                    await processing_message.edit_text(f"🔄 Processing... {percentage:.1f}%")
+                except Exception: # Ignore potential "message not modified" errors
+                    pass
+
+            result = await import_user_groups(chat_id, user_id, progress_callback)
             
             if not result["success"]:
-                await q.edit_message_text(
+                await processing_message.edit_text(
                     f"❌ **Import Failed**\n\n{result['error']}",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=export_keyboard()
@@ -1199,7 +1215,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = connect_db(chat_id)
             
             if data == "dl_current":
-                await q.edit_message_text("🔄 Processing... Please wait.")
+                processing_message = await q.edit_message_text("🔄 Processing... Please wait.")
 
                 export_dir = ensure_chat_dirs(chat_id) / "exports"
                 fmt = "csv"  # Force CSV format for this export
@@ -1207,26 +1223,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 export_file = export_dir / f"Full_Export_{timestamp}.{fmt}"
 
                 all_content = conn.execute("SELECT content, type FROM links ORDER BY added_at ASC").fetchall()
+                total = len(all_content)
 
                 if not all_content:
-                    await q.edit_message_text("❌ No data found in the database to export.")
+                    await processing_message.edit_text("❌ No data found in the database to export.")
                     return
 
                 # Write directly to CSV format
                 with export_file.open("w", encoding="utf-8", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(["content", "type"])
-                    for content, ctype in all_content:
+                    for i, (content, ctype) in enumerate(all_content):
                         writer.writerow([content, ctype])
+                        if (i + 1) % 100 == 0:
+                            percentage = ((i + 1) / total) * 100
+                            try:
+                                await processing_message.edit_text(f"🔄 Processing... {percentage:.1f}%")
+                            except Exception: pass
 
                 await q.message.reply_document(
                     document=InputFile(export_file.open("rb"), filename=f"Full_Data_Export.{fmt}"),
                     caption=f"✅ **Full Data Export**\n\n"
-                            f"• Total Items: {len(all_content):,}\n"
+                            f"• Total Items: {total:,}\n"
                             f"• Format: {fmt.upper()}",
                     parse_mode=ParseMode.MARKDOWN
                 )
-                await q.delete_message() # remove "Generating..." message
+                await processing_message.delete()
 
             elif data == "new_file":
                 _, fmt = read_current_file(chat_id)
@@ -1404,17 +1426,17 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                     if "username" in header and "name" in header:
                         parsing_mode = "Group Import"
                         title = "Group Import Complete"
-                        added, skipped, processed = _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt)
+                        added, skipped, processed = await _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
                     elif "content" in header and "type" in header:
                         parsing_mode = "Bot Data File"
-                        added, skipped, processed = _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt)
+                        added, skipped, processed = await _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
                     else:
-                        added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
+                        added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
 
                 except (StopIteration, csv.Error):
-                    added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
+                    added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
             else: # .txt file
-                added, skipped, processed = _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt)
+                added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
 
         conn.commit()
         total = get_stat(conn, "content_total")
@@ -1486,11 +1508,13 @@ def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
         incr_stat(conn, "dups_total", 1)
         return 0, 1
 
-def _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+async def _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
     """Parses a CSV file from the bot's group export feature."""
     added, skipped, processed = 0, 0, 0
     logger.info("Parsing file as a Group Export CSV.")
-    for row in reader:
+    rows = list(reader)
+    total = len(rows)
+    for i, row in enumerate(rows):
         processed += 1
         username = row.get("username", "").strip()
         if not username:
@@ -1504,13 +1528,22 @@ def _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt) ->
             a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
             added += a
             skipped += s
+
+        if (i + 1) % 20 == 0:
+            percentage = ((i + 1) / total) * 100
+            try:
+                await message.edit_text(f"🔄 Processing... {percentage:.1f}%")
+            except Exception: pass
+
     return added, skipped, processed
 
-def _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+async def _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
     """Parses a CSV file from the bot's own data file format."""
     added, skipped, processed = 0, 0, 0
     logger.info("Parsing file as a Bot Data File (CSV).")
-    for row in reader:
+    rows = list(reader)
+    total = len(rows)
+    for i, row in enumerate(rows):
         processed += 1
         content = row.get("content", "").strip()
         ctype = row.get("type", "").strip()
@@ -1519,12 +1552,20 @@ def _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt) -> Tup
         a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
         added += a
         skipped += s
+
+        if (i + 1) % 20 == 0:
+            percentage = ((i + 1) / total) * 100
+            try:
+                await message.edit_text(f"🔄 Processing... {percentage:.1f}%")
+            except Exception: pass
+
     return added, skipped, processed
 
-def _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt) -> Tuple[int, int, int]:
+async def _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
     """Parses a generic text file line by line using regex."""
     added, skipped, processed = 0, 0, 0
     logger.info("Parsing file with line-by-line regex mode.")
+    total = len(lines)
     for i, line in enumerate(lines):
         processed += 1
         line = line.strip()
@@ -1554,6 +1595,13 @@ def _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt) ->
             a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
             added += a
             skipped += s
+
+        if (i + 1) % 20 == 0:
+            percentage = ((i + 1) / total) * 100
+            try:
+                await message.edit_text(f"🔄 Processing... {percentage:.1f}%")
+            except Exception: pass
+
     return added, skipped, processed
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
