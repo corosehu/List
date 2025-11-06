@@ -1753,7 +1753,7 @@ def main():
     print("Press Ctrl+C to stop.")
     
     try:
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
     except KeyboardInterrupt:
         print("\n👋 Bot stopped.")
 
