@@ -50,6 +50,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.ext.httpx_client import HttpxClient
 
 try:
     from telethon import TelegramClient
@@ -1374,33 +1375,46 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the file upload process by dispatching to specialized parsers."""
+    """Handles the file upload process with robust logging and cleanup."""
     if not await admin_guard(update, context) or not context.user_data.get("expecting_upload"):
         return
 
     document = update.effective_message.document
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
 
+    # --- 1. Initial Validation ---
     if not document:
+        logger.warning(f"User {user_id} triggered document handler with no document.")
         await update.message.reply_text("❌ Please send a valid file.")
         return
 
     file_name = document.file_name
     file_ext = Path(file_name).suffix.lower()
+    logger.info(f"Received file '{file_name}' from user {user_id} in chat {chat_id}.")
 
     if file_ext not in (".txt", ".csv"):
+        logger.warning(f"User {user_id} uploaded unsupported file type: {file_ext}")
         await update.message.reply_text("❌ Only `.txt` or `.csv` files are supported.")
         return
 
-    # Acknowledge and set status to 'processing'
+    # --- 2. Setup and Pre-processing ---
     processing_message = await update.message.reply_text("🔄 Processing... Please wait.")
+    conn = None
+    temp_path = None
 
-    conn = connect_db(chat_id)
     try:
+        conn = connect_db(chat_id)
+        logger.info(f"Database connection established for chat {chat_id}.")
+
+        # --- 3. File Download ---
+        logger.info(f"Downloading file '{file_name}' from Telegram.")
         file = await document.get_file()
         temp_path = DATA_DIR / f"temp_upload_{chat_id}_{document.file_unique_id}{file_ext}"
         await file.download_to_drive(temp_path)
+        logger.info(f"File downloaded successfully to '{temp_path}'.")
 
+        # --- 4. File and Database Preparation ---
         current_file, current_fmt = read_current_file(chat_id)
         if not current_file:
             current_file = next_file_name(chat_id, current_fmt)
@@ -1413,8 +1427,12 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         parsing_mode = "Generic Text File"
         title = "File Restore Complete"
 
+        # --- 5. File Parsing ---
+        logger.info(f"Starting to parse '{file_name}' (extension: {file_ext}).")
         with temp_path.open("r", encoding="utf-8", newline="") as f:
             lines = f.readlines()
+            if not lines:
+                raise ValueError("File is empty or could not be read.")
             f.seek(0)
 
             if file_ext == ".csv":
@@ -1431,17 +1449,23 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
                         parsing_mode = "Bot Data File"
                         added, skipped, processed = await _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
                     else:
+                        parsing_mode = "Generic CSV (as Text)"
                         added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
 
                 except (StopIteration, csv.Error):
+                    parsing_mode = "Malformed CSV (as Text)"
                     added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
             else: # .txt file
                 added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
 
+        logger.info(f"Parsing complete. Mode: '{parsing_mode}'. Added: {added}, Skipped: {skipped}, Processed: {processed}.")
+
+        # --- 6. Finalize and Report ---
+        logger.info("Committing changes to the database.")
         conn.commit()
         total = get_stat(conn, "content_total")
+        logger.info(f"Database commit successful. New total: {total}.")
 
-        # --- Refined User Message ---
         if parsing_mode == "Bot Data File" and added == 0 and skipped > 0:
             final_message = (
                 f"✅ **Restore Complete**\n\n"
@@ -1468,19 +1492,26 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
+        logger.info(f"Final success message sent to user {user_id}.")
 
     except Exception as e:
-        logger.error(f"Upload failed for user {chat_id} with file '{file_name}': {traceback.format_exc()}")
+        logger.error(f"Upload failed for user {user_id} with file '{file_name}': {traceback.format_exc()}")
         await processing_message.edit_text(
             f"❌ **Upload Failed**\n\nAn unexpected error occurred: `{str(e)}`\n\nPlease check the bot logs for more details.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
+
     finally:
-        conn.close()
-        if "temp_path" in locals() and temp_path.exists():
+        # --- 7. Guaranteed Cleanup ---
+        if conn:
+            conn.close()
+            logger.info(f"Database connection closed for chat {chat_id}.")
+        if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+            logger.info(f"Temporary file '{temp_path}' deleted.")
         context.user_data["expecting_upload"] = False
+        logger.info(f"Reset 'expecting_upload' flag for user {user_id}.")
 
 def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype):
     """Normalizes content and adds it to the DB, returning (added, skipped)."""
@@ -1733,7 +1764,8 @@ def main():
         print(f"⚠️ Database setup warning: {e}")
     
     # Build application
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    client = HttpxClient(connect_timeout=30, read_timeout=30)
+    app = ApplicationBuilder().token(BOT_TOKEN).httpx_client(client).build()
     
     # Command handlers
     app.add_handler(CommandHandler("start", start))
