@@ -1442,16 +1442,29 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         total = get_stat(conn, "content_total")
 
         # --- Refined User Message ---
+        if parsing_mode == "Bot Data File" and added == 0 and skipped > 0:
+            final_message = (
+                f"✅ **Restore Complete**\n\n"
+                f"The file was successfully processed. All {skipped:,} items in the file were found to be duplicates that already exist in the database.\n\n"
+                f"**No new items were added.**\n\n"
+                f"**Database Status:**\n"
+                f"• Total Saved Items: {total:,}"
+            )
+        else:
+            final_message = (
+                f"✅ **{title}**\n\n"
+                f"**File Summary:**\n"
+                f"• Parsing Mode: `{parsing_mode}`\n"
+                f"• Lines/Rows Processed: {processed:,}\n"
+                f"• New Items Added: {added:,}\n"
+                f"• Duplicates Skipped: {skipped:,}\n\n"
+                f"**Database Status:**\n"
+                f"• Total Saved Items: {total:,}\n\n"
+                f"Current file `{current_file.name}` has been updated."
+            )
+
         await processing_message.edit_text(
-            f"✅ **{title}**\n\n"
-            f"**File Summary:**\n"
-            f"• Parsing Mode: `{parsing_mode}`\n"
-            f"• Lines/Rows Processed: {processed:,}\n"
-            f"• New Items Added: {added:,}\n"
-            f"• Duplicates Skipped: {skipped:,}\n\n"
-            f"**Database Status:**\n"
-            f"• Total Saved Items: {total:,}\n\n"
-            f"Current file `{current_file.name}` has been updated.",
+            final_message,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_keyboard()
         )
