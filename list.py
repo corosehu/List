@@ -398,8 +398,7 @@ def login_keyboard() -> InlineKeyboardMarkup:
 
 def export_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Export Groups", callback_data="export_groups")],
-        [InlineKeyboardButton("📝 Create Links File", callback_data="create_links_file")],
+        [InlineKeyboardButton("📥 Import My Groups", callback_data="import_groups")],
         [InlineKeyboardButton("📊 Export History", callback_data="export_history")],
         [InlineKeyboardButton("📥 Download Exports", callback_data="dl_exports")],
         [InlineKeyboardButton("◀️ Back to Main", callback_data="back_main")]
@@ -726,24 +725,21 @@ async def handle_login_process(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
 
 # =========================
-# === GROUP EXPORT ========
+# === GROUP IMPORT ========
 # =========================
 
-async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
-    """Export all user's groups and create links file."""
+async def import_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
+    """Scans all user's groups and saves public links/usernames to the database."""
     result = {
         "success": False,
         "groups_count": 0,
-        "success_count": 0,
+        "added": 0,
+        "skipped": 0,
         "failed_count": 0,
-        "export_file": None,
-        "failed_file": None,
-        "links_file": None,
         "error": None
     }
     
     try:
-        # Get user session
         session_data = await get_user_session(chat_id, user_id)
         if not session_data or not session_data.get('session_string'):
             result["error"] = "No active session. Please login first."
@@ -753,152 +749,77 @@ async def export_user_groups(chat_id: int, user_id: int) -> Dict[str, Any]:
         api_hash = session_data['api_hash']
         session_string = session_data['session_string']
         
-        # Connect with Telethon
         client = TelegramClient(StringSession(session_string), api_id, api_hash)
         await client.connect()
         
         if not await client.is_user_authorized():
             result["error"] = "Session expired. Please login again."
+            await client.disconnect()
             return result
         
-        # Get all dialogs
+        conn = connect_db(chat_id)
+        current_file, current_fmt = read_current_file(chat_id)
+        if not current_file:
+            current_file = next_file_name(chat_id, current_fmt)
+            set_current_file(chat_id, current_file, current_fmt)
+
         dialogs = await client.get_dialogs()
-        groups = []
-        failed_groups = []
-        all_links = []  # Store all links and usernames
         
         for dialog in dialogs:
+            result["groups_count"] += 1
             try:
-                if dialog.is_group or dialog.is_channel:
-                    # Extract group info
-                    entity = dialog.entity
-                    username = getattr(entity, 'username', None)
+                if (dialog.is_group or dialog.is_channel) and dialog.entity.username:
+                    username = dialog.entity.username
                     
-                    group_info = {
-                        "name": dialog.name,
-                        "username": username or '',
-                        "id": dialog.id,
-                        "members_count": getattr(entity, 'participants_count', 'N/A'),
-                        "type": "Channel" if dialog.is_channel else "Group",
-                        "is_public": bool(username),
-                        "exported_at": dt.datetime.now(dt.timezone.utc).isoformat()
-                    }
-                    groups.append(group_info)
-                    result["success_count"] += 1
+                    # Add both @username and t.me/ link to ensure comprehensive capture
+                    # The _add_content_to_db function will handle normalization and prevent duplicates
                     
-                    # Collect links and usernames
-                    if username:
-                        all_links.append(f"https://t.me/{username}")
+                    # Add as link
+                    a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, f"https://t.me/{username}", "link")
+                    result["added"] += a
+                    result["skipped"] += s
                     
-                    # Small delay to avoid rate limits
-                    await asyncio.sleep(0.1)
+                    # Add as username
+                    a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, username, "username")
+                    result["added"] += a
+                    result["skipped"] += s
+
+                    await asyncio.sleep(0.05) # Small delay to be safe
                     
             except Exception as e:
-                failed_info = {
-                    "name": getattr(dialog, 'name', 'Unknown'),
-                    "id": getattr(dialog, 'id', 'Unknown'),
-                    "error": str(e),
-                    "failed_at": dt.datetime.now(dt.timezone.utc).isoformat()
-                }
-                failed_groups.append(failed_info)
+                logger.warning(f"Could not process group '{dialog.name}': {e}")
                 result["failed_count"] += 1
-        
-        await client.disconnect()
-        
-        # Save successful exports
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_dir = ensure_chat_dirs(chat_id) / "exports"
-        
-        if groups:
-            export_file = export_dir / f"groups_export_{timestamp}.csv"
-            
-            with export_file.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f, 
-                    fieldnames=["name", "username", "id", "members_count", "type", "is_public", "exported_at"]
-                )
-                writer.writeheader()
-                writer.writerows(groups)
-            
-            # Ensure file is not empty
-            ensure_file_not_empty(export_file, "csv")
-            result["export_file"] = export_file
-        
-        # Create links file from groups
-        if all_links:
-            links_file = export_dir / f"group_links_{timestamp}.txt"
-            with links_file.open("w", encoding="utf-8") as f:
-                f.write("# Group Links and Usernames Export\n")
-                f.write(f"# Exported: {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
-                f.write(f"# Total Groups: {result['success_count']}\n")
-                f.write("#" + "="*50 + "\n\n")
-                
-                for link in all_links:
-                    f.write(f"{link}\n")
-            
-            result["links_file"] = links_file
-        
-        # Save failed exports
-        if failed_groups:
-            failed_dir = ensure_chat_dirs(chat_id) / "failed"
-            timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            failed_file = failed_dir / f"failed_groups_{timestamp}.csv"
-            
-            with failed_file.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=["name", "id", "error", "failed_at"]
-                )
-                writer.writeheader()
-                writer.writerows(failed_groups)
-            
-            result["failed_file"] = failed_file
-        
-        result["groups_count"] = result["success_count"] + result["failed_count"]
-        result["success"] = True
-        
-        # Save export history with links file
-        conn = connect_db(chat_id)
-        try:
-            conn.execute(
-                """INSERT INTO export_history 
-                   (user_id, export_date, groups_count, success_count, failed_count, export_file, failed_file, links_file)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    user_id,
-                    dt.datetime.now(dt.timezone.utc).isoformat(),
-                    result["groups_count"],
-                    result["success_count"],
-                    result["failed_count"],
-                    str(result["export_file"]) if result["export_file"] else None,
-                    str(result["failed_file"]) if result["failed_file"] else None,
-                    str(result["links_file"]) if result["links_file"] else None
-                )
-            )
-        except sqlite3.OperationalError:
-            # If links_file column doesn't exist, add it
-            conn.execute("ALTER TABLE export_history ADD COLUMN links_file TEXT")
-            conn.execute(
-                """INSERT INTO export_history 
-                   (user_id, export_date, groups_count, success_count, failed_count, export_file, failed_file, links_file)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    user_id,
-                    dt.datetime.now(dt.timezone.utc).isoformat(),
-                    result["groups_count"],
-                    result["success_count"],
-                    result["failed_count"],
-                    str(result["export_file"]) if result["export_file"] else None,
-                    str(result["failed_file"]) if result["failed_file"] else None,
-                    str(result["links_file"]) if result["links_file"] else None
-                )
-            )
+
         conn.commit()
         conn.close()
+        await client.disconnect()
+
+        # Log this import event to history for tracking
+        history_conn = connect_db(chat_id)
+        try:
+             history_conn.execute(
+                """INSERT INTO export_history 
+                   (user_id, export_date, groups_count, success_count, failed_count)
+                   VALUES (?,?,?,?,?)""",
+                (
+                    user_id,
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                    result["groups_count"],
+                    result["added"], # Using success_count to store 'added'
+                    result["failed_count"]
+                )
+            )
+             history_conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to save import history: {e}")
+        finally:
+            history_conn.close()
+
+        result["success"] = True
         
     except Exception as e:
-        result["error"] = f"Export failed: {str(e)}"
-        print(f"Export error: {traceback.format_exc()}")
+        result["error"] = f"Import failed: {str(e)}"
+        logger.error(f"Group import error: {traceback.format_exc()}")
     
     return result
 
@@ -973,7 +894,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/usetxt - Switch to TXT format\n\n"
         "**Account Features:**\n"
         "/login - Telegram account login\n"
-        "/export - Export your groups\n\n"
+        "/import - Import your groups\n\n"
         "**Support:** @Corose | @fxeeo"
     )
     
@@ -1160,7 +1081,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=login_keyboard()
             )
             
-        elif data == "export_groups":
+        elif data == "import_groups":
             # Check if user is logged in first
             session_data = await get_user_session(chat_id, user_id)
             if not session_data or not session_data.get('session_string'):
@@ -1172,57 +1093,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            await q.edit_message_text("📤 Exporting groups... Please wait.")
+            await q.edit_message_text("📥 **Importing Groups...**\n\nThis will scan all your joined groups and channels, saving any public @usernames or `t.me` links to the main database. Please wait.")
             
-            result = await export_user_groups(chat_id, user_id)
+            result = await import_user_groups(chat_id, user_id)
             
             if not result["success"]:
                 await q.edit_message_text(
-                    f"❌ **Export Failed**\n\n{result['error']}",
+                    f"❌ **Import Failed**\n\n{result['error']}",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=export_keyboard()
                 )
             else:
+                conn = connect_db(chat_id)
+                total_content = get_stat(conn, "content_total")
+                conn.close()
+
                 status_text = (
-                    f"✅ **Export Complete!**\n\n"
-                    f"**Summary:**\n"
-                    f"• Total groups: {result['groups_count']}\n"
-                    f"• Successfully exported: {result['success_count']}\n"
-                    f"• Failed: {result['failed_count']}\n\n"
-                    f"**Files Created:**\n"
+                    f"✅ **Import Complete!**\n\n"
+                    f"**Scan Summary:**\n"
+                    f"• Groups Scanned: {result['groups_count']:,}\n"
+                    f"• New Items Added: {result['added']:,}\n"
+                    f"• Duplicates Found: {result['skipped']:,}\n\n"
+                    f"**Database Status:**\n"
+                    f"• Total Saved Items: {total_content:,}\n"
                 )
                 
-                if result['export_file']:
-                    status_text += f"✅ Groups CSV file\n"
-                if result['links_file']:
-                    status_text += f"✅ Links TXT file (usernames & links)\n"
-                if result['failed_file']:
-                    status_text += f"⚠️ Failed groups log\n"
-                
+                if result['failed_count'] > 0:
+                    status_text += f"\n⚠️ Encountered errors with {result['failed_count']} groups. Check logs for details."
+
                 await q.edit_message_text(
                     status_text,
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=export_keyboard()
                 )
-                
-                # Send the files
-                if result['export_file']:
-                    await q.message.reply_document(
-                        document=InputFile(result['export_file'].open("rb"), filename=result['export_file'].name),
-                        caption=f"✅ Groups Export: {result['success_count']} groups"
-                    )
-                
-                if result['links_file']:
-                    await q.message.reply_document(
-                        document=InputFile(result['links_file'].open("rb"), filename=result['links_file'].name),
-                        caption=f"📋 Links File: All group links and @usernames"
-                    )
-                
-                if result['failed_file']:
-                    await q.message.reply_document(
-                        document=InputFile(result['failed_file'].open("rb"), filename=result['failed_file'].name),
-                        caption=f"⚠️ Failed Groups: {result['failed_count']} groups"
-                    )
                     
         elif data == "export_history":
             conn = connect_db(chat_id)
@@ -1235,65 +1138,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             
             if history:
-                history_text = "📊 **Export History**\n\n"
+                history_text = "📊 **Import History**\n\n"
                 for row in history:
                     date = dt.datetime.fromisoformat(row[0]).strftime("%Y-%m-%d %H:%M")
                     history_text += (
                         f"**{date}**\n"
-                        f"• Total: {row[1]} | Success: {row[2]} | Failed: {row[3]}\n\n"
+                        f"• Groups Scanned: {row[1]}\n"
+                        f"• New Items Added: {row[2]}\n"
+                        f"• Errors: {row[3]}\n\n"
                     )
             else:
-                history_text = "📊 **Export History**\n\nNo exports yet."
+                history_text = "📊 **Import History**\n\nNo imports yet."
             
             await q.edit_message_text(
                 history_text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=export_keyboard()
             )
-            
-        elif data == "create_links_file":
-            # Check if user is logged in
-            session_data = await get_user_session(chat_id, user_id)
-            if not session_data or not session_data.get('session_string'):
-                await q.edit_message_text(
-                    "❌ **Not Logged In**\n\n"
-                    "Please login first to create links file.",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=main_keyboard()
-                )
-                return
-            
-            await q.edit_message_text("📝 Creating links file from your groups...")
-            
-            # Use export function but only for links extraction
-            result = await export_user_groups(chat_id, user_id)
-            
-            if not result["success"]:
-                await q.edit_message_text(
-                    f"❌ **Failed to create links file**\n\n{result['error']}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=export_keyboard()
-                )
-            elif result.get('links_file'):
-                await q.edit_message_text(
-                    f"✅ **Links File Created!**\n\n"
-                    f"• Groups processed: {result['success_count']}\n"
-                    f"• Links and usernames extracted\n"
-                    f"• File ready for download",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=export_keyboard()
-                )
-                
-                # Send the links file
-                await q.message.reply_document(
-                    document=InputFile(result['links_file'].open("rb"), filename=result['links_file'].name),
-                    caption=f"📝 Links File: All group links and @usernames from {result['success_count']} groups"
-                )
-            else:
-                await q.edit_message_text(
-                    "⚠️ No public groups found to extract links from.",
-                    reply_markup=export_keyboard()
-                )
         
         elif data == "dl_exports":
             export_dir = ensure_chat_dirs(chat_id) / "exports"
