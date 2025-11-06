@@ -1429,32 +1429,29 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         # --- 5. File Parsing ---
         logger.info(f"Starting to parse '{file_name}' (extension: {file_ext}).")
         with temp_path.open("r", encoding="utf-8", newline="") as f:
-            lines = f.readlines()
-            if not lines:
+            if not f.read(1): # Check if file is empty
                 raise ValueError("File is empty or could not be read.")
             f.seek(0)
 
             if file_ext == ".csv":
                 try:
-                    header = [h.strip() for h in next(csv.reader(f))]
+                    # Sniff to detect CSV dialect
+                    dialect = csv.Sniffer().sniff(f.read(1024))
                     f.seek(0)
-                    reader = csv.DictReader(f)
+                    reader = csv.reader(f, dialect)
 
-                    if "username" in header and "name" in header:
-                        parsing_mode = "Group Import"
-                        title = "Group Import Complete"
-                        added, skipped, processed = await _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
-                    elif "content" in header and "type" in header:
-                        parsing_mode = "Bot Data File"
-                        added, skipped, processed = await _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
-                    else:
-                        parsing_mode = "Generic CSV (as Text)"
-                        added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
+                    parsing_mode = "Generic CSV"
+                    title = "CSV Import Complete"
+                    added, skipped, processed = await _parse_generic_csv(reader, conn, chat_id, current_file, current_fmt, processing_message)
 
-                except (StopIteration, csv.Error):
+                except csv.Error:
+                    # If it's a malformed CSV, treat it as a text file
+                    f.seek(0)
+                    lines = f.readlines()
                     parsing_mode = "Malformed CSV (as Text)"
                     added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
             else: # .txt file
+                lines = f.readlines()
                 added, skipped, processed = await _parse_generic_text_file(lines, conn, chat_id, current_file, current_fmt, processing_message)
 
         logger.info(f"Parsing complete. Mode: '{parsing_mode}'. Added: {added}, Skipped: {skipped}, Processed: {processed}.")
@@ -1551,56 +1548,44 @@ def _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
         incr_stat(conn, "dups_total", 1)
         return 0, 1
 
-async def _parse_group_export_csv(reader, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
-    """Parses a CSV file from the bot's group export feature."""
+async def _parse_generic_csv(reader, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
+    """Parses a generic CSV file by scanning every field for links/usernames."""
     added, skipped, processed = 0, 0, 0
-    logger.info("Parsing file as a Group Export CSV.")
+    logger.info("Parsing file as a Generic CSV.")
+
+    # Read all rows into memory to get a total count for progress reporting
     rows = list(reader)
-    total = len(rows)
+    total_rows = len(rows)
+
     for i, row in enumerate(rows):
         processed += 1
-        username = row.get("username", "").strip()
-        if not username:
-            continue
+        # In a generic CSV, we don't know the column names, so we check all values
+        for field in row:
+            if not field:  # Skip empty fields
+                continue
 
-        to_add = [
-            (f"https://t.me/{username}", "link"),
-            (f"@{username}", "username")
-        ]
-        for content, ctype in to_add:
-            a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
-            added += a
-            skipped += s
+            # Find all potential links and usernames in the current field
+            links = [m.group(1) for m in URL_REGEX.finditer(field)]
+            usernames = [m.group(1) for m in USERNAME_REGEX.finditer(field)]
 
-        if (i + 1) % 20 == 0:
-            percentage = ((i + 1) / total) * 100
+            for link in links:
+                a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, link, "link")
+                added += a
+                skipped += s
+
+            for username in usernames:
+                a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, username, "username")
+                added += a
+                skipped += s
+
+        # --- Progress Update ---
+        # Update every 20 rows or on the last row to avoid hitting API limits
+        if (i + 1) % 20 == 0 or (i + 1) == total_rows:
+            percentage = ((i + 1) / total_rows) * 100
             try:
                 await message.edit_text(f"🔄 Processing... {percentage:.1f}%")
-            except Exception: pass
-
-    return added, skipped, processed
-
-async def _parse_bot_data_csv(reader, conn, chat_id, current_file, current_fmt, message) -> Tuple[int, int, int]:
-    """Parses a CSV file from the bot's own data file format."""
-    added, skipped, processed = 0, 0, 0
-    logger.info("Parsing file as a Bot Data File (CSV).")
-    rows = list(reader)
-    total = len(rows)
-    for i, row in enumerate(rows):
-        processed += 1
-        content = row.get("content", "").strip()
-        ctype = row.get("type", "").strip()
-        if not content or ctype not in ("link", "username"):
-            continue
-        a, s = _add_content_to_db(conn, chat_id, current_file, current_fmt, content, ctype)
-        added += a
-        skipped += s
-
-        if (i + 1) % 20 == 0:
-            percentage = ((i + 1) / total) * 100
-            try:
-                await message.edit_text(f"🔄 Processing... {percentage:.1f}%")
-            except Exception: pass
+            except Exception:  # Ignore "message not modified" errors
+                pass
 
     return added, skipped, processed
 
