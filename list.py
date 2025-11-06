@@ -50,7 +50,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.ext.httpx_client import HttpxClient
 
 try:
     from telethon import TelegramClient
@@ -1764,8 +1763,7 @@ def main():
         print(f"⚠️ Database setup warning: {e}")
     
     # Build application
-    client = HttpxClient(connect_timeout=30, read_timeout=30)
-    app = ApplicationBuilder().token(BOT_TOKEN).httpx_client(client).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     
     # Command handlers
     app.add_handler(CommandHandler("start", start))
