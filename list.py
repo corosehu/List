@@ -1202,7 +1202,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("🔄 Generating your full data export... please wait.")
 
                 export_dir = ensure_chat_dirs(chat_id) / "exports"
-                _, fmt = read_current_file(chat_id)
+                fmt = "csv"  # Force CSV format for this export
                 timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
                 export_file = export_dir / f"Full_Export_{timestamp}.{fmt}"
 
@@ -1212,21 +1212,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await q.edit_message_text("❌ No data found in the database to export.")
                     return
 
+                # Write directly to CSV format
                 with export_file.open("w", encoding="utf-8", newline="") as f:
-                    if fmt == "csv":
-                        writer = csv.writer(f)
-                        writer.writerow(["content", "type"])
-                        for content, ctype in all_content:
-                            writer.writerow([content, ctype])
-                    else: # txt
-                        f.write(f"# Full Data Export - {dt.datetime.now(dt.timezone.utc).isoformat()}\n")
-                        f.write(f"# Total Items: {len(all_content)}\n\n")
-                        for content, ctype in all_content:
-                            # Reconstruct a readable format for txt
-                            if ctype == "username":
-                                f.write(f"@{content}\n")
-                            else:
-                                f.write(f"{content}\n")
+                    writer = csv.writer(f)
+                    writer.writerow(["content", "type"])
+                    for content, ctype in all_content:
+                        writer.writerow([content, ctype])
 
                 await q.message.reply_document(
                     document=InputFile(export_file.open("rb"), filename=f"Full_Data_Export.{fmt}"),
