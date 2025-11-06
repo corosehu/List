@@ -1093,7 +1093,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            await q.edit_message_text("📥 **Importing Groups...**\n\nThis will scan all your joined groups and channels, saving any public @usernames or `t.me` links to the main database. Please wait.")
+            await q.edit_message_text("🔄 Processing... Please wait.")
             
             result = await import_user_groups(chat_id, user_id)
             
@@ -1199,7 +1199,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = connect_db(chat_id)
             
             if data == "dl_current":
-                await q.edit_message_text("🔄 Generating your full data export... please wait.")
+                await q.edit_message_text("🔄 Processing... Please wait.")
 
                 export_dir = ensure_chat_dirs(chat_id) / "exports"
                 fmt = "csv"  # Force CSV format for this export
@@ -1371,7 +1371,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Acknowledge and set status to 'processing'
-    processing_message = await update.message.reply_text("🔄 Processing your file, please wait...")
+    processing_message = await update.message.reply_text("🔄 Processing... Please wait.")
 
     conn = connect_db(chat_id)
     try:
