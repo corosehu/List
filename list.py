@@ -1595,12 +1595,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     conn = connect_db(chat_id)
-    _, fmt = read_current_file(chat_id)
-    fmt = fmt if fmt in ("txt", "csv") else DEFAULT_FILE_FORMAT
     
     # Get or create current file
-    p = next_file_name(chat_id, fmt)
-    if not p.exists():
+    p, fmt = read_current_file(chat_id)
+    if not p:
+        fmt = fmt if fmt in ("txt", "csv") else DEFAULT_FILE_FORMAT
+        p = next_file_name(chat_id, fmt)
         p.touch(exist_ok=True)
         ensure_file_not_empty(p, fmt)
         set_current_file(chat_id, p, fmt)
@@ -1619,28 +1619,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn.commit()
     
-    # Send status
-    total_content = get_stat(conn, "content_total")
-    dups = get_stat(conn, "dups_total")
-    
-    conn.close()
-    
-    status_text = (
-        f"✅ **Processing Complete**\n\n"
-        f"**This Message:**\n"
-        f"• Added: {added}\n"
-        f"• Duplicates: {skipped}\n\n"
-        f"**Total Statistics:**\n"
-        f"• Saved: {total_content:,}\n"
-        f"• Duplicates: {dups:,}\n\n"
-        f"Current file: `{p.name}`"
-    )
-    
-    await update.effective_message.reply_text(
-        status_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_keyboard()
-    )
+    # After processing, decide which message to send
+    if len(all_content) == 1 and skipped == 1:
+        # Case: A single item was sent and it was a duplicate.
+        content, _ = all_content[0]
+        conn.close() # Close connection before sending reply
+        await update.effective_message.reply_text(
+            f"❌ **Duplicate Entry**\n\nThe item `{content}` already exists in the database and was not added.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard()
+        )
+    else:
+        # Case: Bulk message OR single/multiple successful additions.
+        total_content = get_stat(conn, "content_total")
+        dups = get_stat(conn, "dups_total")
+        conn.close()
+
+        # Don't show the summary if nothing was processed in this message.
+        if added == 0 and skipped == 0:
+            return
+
+        status_text = (
+            f"✅ **Processing Complete**\n\n"
+            f"**This Message:**\n"
+            f"• Added: {added}\n"
+            f"• Duplicates: {skipped}\n\n"
+            f"**Total Statistics:**\n"
+            f"• Saved: {total_content:,}\n"
+            f"• Duplicates: {dups:,}\n\n"
+            f"Current file: `{p.name}`"
+        )
+        await update.effective_message.reply_text(
+            status_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard()
+        )
 
 # =========================
 # === MAIN ENTRY POINT ====
